@@ -1,106 +1,174 @@
-"""Forecast the Yes price of each market of Polymarket's "Next CEO of NVIDIA?" event,
-minute by minute, four hours past each checkpoint, as five quantiles.
+#!/usr/bin/env python3
+"""Quantile forecaster: reads <id>.in JSON cases, writes <id>.out forecasts.
 
-Self-contained: Python 3 standard library only, no network, deterministic.  Reads every
-<case>.in in the input directory and writes <case>.out next to the output directory.
-
-Model
------
-* Median: the event's markets are mutually exclusive, so the sum of their Yes prices
-  tends back toward 1.  Each market's median is scaled by the reverted sum path
-  S(h) = S + (1 - S) * (1 - exp(-h / TAU)).
-* Spread: a blend of a fixed width and a per-market width from the market's own recent
-  volatility (MAD of 60-minute changes over the last 24 hours), applied as a
-  random-walk width sqrt(h) around the median, asymmetric across quantile levels.
+Standard library only, deterministic, no network.
 """
 
 import json
 import math
 import os
+import sys
 
-QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
-# Fixed width per sqrt(minute), in price units, per quantile level.
 C = [0.003, 0.0006, 0.0002, 0.0002, 0.001]
-# Multipliers of the per-market volatility, per quantile level.
 K = [1.0, 0.5, 0.0, 0.1, 0.5]
 LAM = 0.3
-TAU = 120.0
 HORIZON = 240
+MAD_SCALE = 0.67449
+DIFF_LAG = 60
+LOOKBACK = 1440
+REVERSION_MINUTES = 110.0
 
 
-def mad(values):
-    if not values:
+def _as_float(value):
+    """Coerce a value to a finite float, or None if it is unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else (hi if x > hi else x)
+
+
+def _mad_volatility(prices):
+    """MAD of |p[t+60]-p[t]| over the last 1440 minutes, scaled to per-minute sd."""
+    clean = [_as_float(p) for p in prices]
+    n = len(clean)
+    if n == 0:
         return 0.0
-    values.sort()
-    n = len(values)
-    return values[n // 2] if n % 2 else 0.5 * (values[n // 2 - 1] + values[n // 2])
+
+    first = max(0, n - LOOKBACK - DIFF_LAG)
+    abs_diffs = []
+    for t in range(first, n - DIFF_LAG):
+        a = clean[t]
+        b = clean[t + DIFF_LAG]
+        if a is None or b is None:
+            continue
+        d = b - a
+        if not math.isfinite(d):
+            continue
+        abs_diffs.append(abs(d))
+
+    if not abs_diffs:
+        return 0.0
+
+    abs_diffs.sort()
+    m = len(abs_diffs)
+    if m % 2 == 1:
+        mad = abs_diffs[m // 2]
+    else:
+        mad = 0.5 * (abs_diffs[m // 2 - 1] + abs_diffs[m // 2])
+
+    s = mad / MAD_SCALE / math.sqrt(DIFF_LAG)
+    if not math.isfinite(s):
+        return 0.0
+    return s
 
 
-def vol(prices):
-    """Price units per sqrt(minute), from the MAD of 60-minute changes over the last 24h."""
-    n = len(prices)
-    first = max(0, n - 1 - 1440)
-    diffs = []
-    t = first
-    while t + 60 < n:
-        a = prices[t]
-        b = prices[t + 60]
-        if a is not None and b is not None:
-            diffs.append(abs(b - a))
-        t += 2
-    return (mad(diffs) / 0.67449) / math.sqrt(60.0)
+def _last_price(prices):
+    for p in reversed(prices):
+        f = _as_float(p)
+        if f is not None:
+            return f
+    return 0.0
 
 
-def price6(x):
-    x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
-    return round(x, 6) + 0.0
+def forecast_market(market, total_last):
+    """Return 240 rows of 5 quantiles for one market."""
+    prices = market.get("prices") or []
+    if not isinstance(prices, list):
+        prices = []
 
-
-def forecast_case(case):
-    markets = case["markets"]
-    horizon = int(case.get("horizon_minutes", HORIZON))
-    total = 0.0
-    for m in markets:
-        p = m["prices"]
-        total += p[-1] if p else 0.0
+    last = _last_price(prices)
+    s = _mad_volatility(prices)
 
     rows = []
-    for m in markets:
-        prices = m["prices"]
-        x = prices[-1] if prices else 0.0
-        s = vol(prices)
-        out = []
-        for h in range(1, horizon + 1):
-            if total > 0.0:
-                ratio = (total + (1.0 - total) * (1.0 - math.exp(-h / TAU))) / total
-                ratio = min(1.6, max(0.6, ratio))
-                med = x * ratio
-            else:
-                med = x
-            row = []
-            for i in range(5):
-                w = (LAM * C[i] + (1.0 - LAM) * K[i] * s) * math.sqrt(h)
-                row.append(price6(med + Z[i] * w))
-            out.append(row)
-        rows.append({"id": m["id"], "q": out})
-    return {"forecasts": rows}
+    for h in range(1, HORIZON + 1):
+        if total_last > 0.0:
+            ratio = (total_last + (1.0 - total_last) * (1.0 - math.exp(-h / REVERSION_MINUTES))) / total_last
+            ratio = _clamp(ratio, 0.6, 1.6)
+            m = last * ratio
+        else:
+            m = last
+
+        sqrt_h = math.sqrt(h)
+        row = []
+        for i in range(5):
+            spread = LAM * C[i] + (1.0 - LAM) * K[i] * s
+            v = m + Z[i] * spread * sqrt_h
+            v = _clamp(v, 0.0, 1.0)
+            v = round(v, 6)
+            row.append(v)
+        rows.append(row)
+
+    return rows
+
+
+def process_case(case):
+    markets = case.get("markets") or []
+    if not isinstance(markets, list):
+        markets = []
+
+    prepared = []
+    total_last = 0.0
+    for market in markets:
+        if not isinstance(market, dict):
+            market = {}
+        prices = market.get("prices") or []
+        if not isinstance(prices, list):
+            prices = []
+        last = _last_price(prices)
+        prepared.append((market.get("id"), prices, last))
+        total_last += last
+
+    forecasts = []
+    for mid, prices, last in prepared:
+        rows = forecast_market({"id": mid, "prices": prices}, total_last)
+        forecasts.append({"id": mid, "q": rows})
+
+    return {"forecasts": forecasts}
 
 
 def main():
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+
+    try:
+        names = sorted(n for n in os.listdir(in_dir) if n.endswith(".in"))
+    except OSError as exc:
+        print(f"error: cannot list input dir {in_dir}: {exc}", file=sys.stderr)
+        return 1
+
     os.makedirs(out_dir, exist_ok=True)
-    for name in sorted(os.listdir(in_dir)):
-        if not name.endswith(".in"):
-            continue
-        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as f:
-            case = json.load(f)
-        result = forecast_case(case)
-        case_id = name[:-3]
-        with open(os.path.join(out_dir, case_id + ".out"), "w", encoding="utf-8") as f:
-            json.dump(result, f, separators=(",", ":"), allow_nan=False)
+
+    for name in names:
+        path = os.path.join(in_dir, name)
+        stem = name[:-3]
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                case = json.load(fh)
+        except (OSError, ValueError) as exc:
+            print(f"error: cannot read {path}: {exc}", file=sys.stderr)
+            return 1
+
+        if not isinstance(case, dict):
+            case = {}
+
+        result = process_case(case)
+
+        out_path = os.path.join(out_dir, stem + ".out")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(result, fh, separators=(",", ":"), allow_nan=False)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
